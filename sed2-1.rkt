@@ -54,12 +54,8 @@
 
 ; expand commands so that each one has only one location
 (define commands
-  (let* ([input (open-input-string "c5,6,/re/")]
-         [raw-commands (parser1 (lambda () (lexer1 input)))])
-    (append-map (λ (cmd)
-                   (map (λ (loc)
-                          (command-exp (command-exp-action cmd) loc)) (command-exp-locations cmd)))
-                 raw-commands)))
+  (let* ([input (open-input-string "c5,6,/re/")])
+    (parser1 (lambda () (lexer1 input)))))
 
 ; are any of the commands about column regexps?
 (define need-headers
