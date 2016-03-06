@@ -4,10 +4,10 @@
          (prefix-in sre: parser-tools/lex-sre)
          parser-tools/yacc)
 
-(define raw-command "c/B/g; l/1/g")
+(define raw-command "s/A/Z/")
 (define fn "/Users/scott/work/racket/z.txt")
 
-(define-tokens a (NUM RE GLOBAL-RE ACTION))
+(define-tokens a (NUM RE GLOBAL-RE ACTION SUB))
 (define-empty-tokens b (- EOF < \; \,))
 
 (define-lex-abbrev digit (char-range "0" "9"))
@@ -24,6 +24,7 @@
    [(union "c" "dc" "l" "dl") (token-ACTION lexeme)]
    [(sre:seq "/" (sre:+ (char-complement "/")) "/g") (token-GLOBAL-RE lexeme)]
    [(sre:seq "/" (sre:+ (char-complement "/")) "/") (token-RE lexeme)]
+   [(sre:seq "s/" (sre:+ (char-complement "/")) "/" (sre:+ (char-complement "/")) "/" (sre:* (union "g"))) (token-SUB lexeme)]
    [(eof) (token-EOF)]
    [whitespace (lexer1 input-port)]))
 
@@ -34,6 +35,7 @@
 (define-struct command-exp (action locations))
 (define-struct action-exp (action))
 (define-struct num-exp (n))
+(define-struct sub-exp (from to flags))
 
 (define parser1
   (parser
@@ -44,7 +46,8 @@
    (grammar
     (commands ((command \; commands) (cons $1 $3))
               ((command) (list $1)))
-    (command ((ACTION region) (command-exp (action-exp $1) $2)))
+    (command ((ACTION region) (command-exp (action-exp $1) $2))
+             ((SUB) (parse-sub-command $1)))
     (region ((location \, region) (cons $1 $3))
             ((location) (list $1)))
     (location ((place) $1)
@@ -54,6 +57,15 @@
               ((place - place) (range-exp $1 $3)))
     (place ((NUM) (num-exp (string->number $1)))
            ((RE) (re-exp $1))))))
+
+(define (parse-sub-command s)
+  (let* ([sep (substring s 1 2)]
+         [parts (string-split s sep)]
+         [from (second parts)]
+         [to (third parts)]
+         [flags (if (equal? (length parts) 4) (string->list (fourth parts)) '())])
+    (sub-exp from to flags)))
+         
 
 (define commands
   (let* ([input (open-input-string raw-command)])
@@ -175,14 +187,31 @@
       (if (xor _invert? (ormap (λ (range) (send range in-range? line line-number)) ranges))
           line
           #f))))
-    
+
+(define substitutor%
+  (class object%
+    (init from to [flags '()])
+    (define _from from)
+    (define _to to)
+    (define _flags flags)
+    (define (f line)
+      (let ([from-re (regexp _from)])
+        (match _flags
+          ['() (regexp-replace from-re line _to)]
+          [(list-no-order #\g) (regexp-replace* from-re line _to)]
+          [else (error (format "unknown flags \"~a\" in substitute command" (list->string _flags)))])))
+    (super-new)
+    (define/public (process line)
+      (f line))))
 
 (define command->object
   (match-lambda
     [(command-exp (action-exp "c") locs) (new column-editor% [locs locs])]
     [(command-exp (action-exp "dc") locs) (new column-editor% [locs locs] [invert? #t])]
     [(command-exp (action-exp "l") locs) (new line-keeper% [locs locs])]
-    [(command-exp (action-exp "dl") locs) (new line-keeper% [locs locs] [invert? #t])]))
+    [(command-exp (action-exp "dl") locs) (new line-keeper% [locs locs] [invert? #t])]
+    [(sub-exp from to flags) (new substitutor% [from from] [to to] [flags flags])]
+    ))
 
 (define command-objects (map command->object commands))
 
