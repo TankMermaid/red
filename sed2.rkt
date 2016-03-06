@@ -2,10 +2,73 @@
 
 (require parser-tools/lex
          (prefix-in sre: parser-tools/lex-sre)
-         parser-tools/yacc)
+         parser-tools/yacc
+         racket/cmdline)
 
-(define raw-command "s/A/Z/")
-(define fn "/Users/scott/work/racket/z.txt")
+(define separator (make-parameter "\t"))
+
+(define raw-command
+  (command-line
+   #:program "sed2"
+   #:once-each
+   [("-F" "--separator") sep
+                         "Column separator (default: tab)"
+                         (separator sep)]
+   #:ps "
+sed2 takes a command made up of four actions:
+ - l  : keep line
+ - dl : drop line
+ - c  : keep column
+ - dc : drop column
+ - s  : substitute
+
+The \"keep\" actions implicitly drop lines or columns that are not
+expressly kept.
+
+The line and column actions are accompanied by specifications of
+their \"domain\". These specifications can be:
+ - numbers like 1
+ - regexps like /foo/
+ - global regexps like /foo/g
+
+Normal regexps match the first occurrence. Numbers and regexps can
+appear in ranges like 1-5 or /foo/-10. Ranges with unspecified lower
+range start at 1 (-5 is equivalent to 1-5); unspecified upper ranges
+to go the number of columns for lines (l6- is like dl1-5).
+
+When a column is specified with a regexp, sed2 searches for that
+pattern in the first line that action sees and figures out which
+columns to keep or drop based on that first line.
+
+Column numbers can be counted \"from the end\" by adding <. Thus
+you can drop the last two columns with c-3< or dc2<-.
+
+Domains can be joined with commas. l1,3,5 keeps the first, third, and
+fifth lines.
+
+Substitutions can use any delimiter, so s/foo/bar/ and s%foo%bar% are
+equivalent. s/from/to/ substitutes the first \"from\", s/from/to/g is
+a global replacement.
+
+Actions can be chained together with semicolons. Thus
+  sed2 \"dc1\" | sed2 \"l1-5\"
+should produce the same result as
+  sed2 \"dc1; l1-5\"
+
+The first line of input to a column command is special. It uses that
+line to determine which columns to keep. Thus \"dl1; c/foo/\" drops
+the first line, looks for foo in the second line of the file, and keeps
+the column that had foo in the second line of the file, while \"c/foo/; dl1\"
+looks for foo in the file's first line, drops that line, and keeps the
+column that had foo in the file's first line.
+
+All line counts are done according to what that action saw, not the file
+numbers. Thus \"dl1-5; dl1-5\" is equivalent to \"dl1-10\". The point here
+is that something like \"l/foo/g; l1-5\" is like grep foo | head -5.
+
+Whitespace in the command string is ignored."
+   #:args (cmd)
+   cmd))
 
 (define-tokens a (NUM RE GLOBAL-RE ACTION SUB))
 (define-empty-tokens b (- EOF < \; \,))
@@ -34,7 +97,7 @@
 (define-struct re-exp (r))
 (define-struct command-exp (action locations))
 (define-struct action-exp (action))
-(define-struct num-exp (n))
+(define-struct num-exp (n from-end?))
 (define-struct sub-exp (from to flags))
 
 (define parser1
@@ -45,6 +108,7 @@
    (tokens a b)
    (grammar
     (commands ((command \; commands) (cons $1 $3))
+              ((command \;) (list $1))
               ((command) (list $1)))
     (command ((ACTION region) (command-exp (action-exp $1) $2))
              ((SUB) (parse-sub-command $1)))
@@ -55,7 +119,8 @@
               ((- place) (range-exp 'start $2))
               ((place -) (range-exp $1 'end))
               ((place - place) (range-exp $1 $3)))
-    (place ((NUM) (num-exp (string->number $1)))
+    (place ((NUM) (num-exp (string->number $1) #f))
+           ((NUM <) (num-exp (string->number $1) #t))
            ((RE) (re-exp $1))))))
 
 (define (parse-sub-command s)
@@ -71,8 +136,6 @@
   (let* ([input (open-input-string raw-command)])
     (parser1 (lambda () (lexer1 input)))))
 
-(define separator (make-parameter "\t"))
-
 (define (string->regexp r)
   (regexp (substring r 1 (sub1 (string-length r)))))
 
@@ -85,11 +148,12 @@
          [column-matches (make-vector n-columns #f)]
          [loc-match (lambda (location)
                       (match location
-                        [(num-exp n) (sub1 n)]
+                        [(num-exp n #f) (sub1 n)]
+                        [(num-exp n #t) (- n-columns n)]
                         [(re-exp r) (length (takef headers (λ (h) (not (regexp-match (string->regexp r) h)))))]))])
     (for ([location locations])
       (match location
-        [(or (num-exp _) (re-exp _)) (vector-set! column-matches (loc-match location) #t)]
+        [(or (num-exp _ _) (re-exp _)) (vector-set! column-matches (loc-match location) #t)]
         [(global-re-exp r) (let ([re (string->global-regexp r)])
                              (for ([i (in-range n-columns)]
                                    [h headers])                               
@@ -141,11 +205,13 @@
     (define _lower
       (match lower
         [(re-exp r) (string->regexp r)]
-        [(num-exp n) n]))
+        [(num-exp n #f) n]
+        [(num-exp _ #t) (error "can't count from the end in lines")]))
     (define _upper
       (match upper
         [(re-exp r) (string->regexp r)]
-        [(num-exp n) n]))
+        [(num-exp n #f) n]
+        [(num-exp _ #t) (error "can't count from the end in lines")]))
     (define _started? started?)
     (define done? #f)
     (super-new)
@@ -175,7 +241,7 @@
     (define ranges
       (map (λ (loc)
              (match loc
-               [(or (num-exp _) (re-exp _)) (new line-range% [lower loc] [upper loc])]
+               [(or (num-exp _ _) (re-exp _)) (new line-range% [lower loc] [upper loc])]
                [(range-exp 'start upper) (new line-range% [lower 1] [upper upper] [started? #t])]
                [(range-exp lower 'end) (new line-range% [lower lower] [upper +inf.0])]
                [(range-exp lower upper) (new line-range% [lower lower] [upper upper])]
@@ -191,15 +257,14 @@
 (define substitutor%
   (class object%
     (init from to [flags '()])
-    (define _from from)
+    (define from-re (regexp from))
     (define _to to)
     (define _flags flags)
     (define (f line)
-      (let ([from-re (regexp _from)])
-        (match _flags
-          ['() (regexp-replace from-re line _to)]
-          [(list-no-order #\g) (regexp-replace* from-re line _to)]
-          [else (error (format "unknown flags \"~a\" in substitute command" (list->string _flags)))])))
+      (match _flags
+        ['() (regexp-replace from-re line _to)]
+        [(list-no-order #\g) (regexp-replace* from-re line _to)]
+        [else (error (format "unknown flags \"~a\" in substitute command" (list->string _flags)))]))
     (super-new)
     (define/public (process line)
       (f line))))
@@ -215,11 +280,10 @@
 
 (define command-objects (map command->object commands))
 
-(call-with-input-file fn
-  (λ (out) (for ([line (in-lines out)])
-             (let ([out-line (for/fold ([l line])
-                                       ([obj command-objects])
-                               #:break (not l)
-                               (send obj process line))])
-               (when out-line
-                 (displayln out-line))))))
+(for ([line (in-lines)])
+  (let ([out-line (for/fold ([l line])
+                            ([obj command-objects])
+                    #:break (not l)
+                    (send obj process l))])
+    (when out-line
+      (displayln out-line))))
