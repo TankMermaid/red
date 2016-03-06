@@ -4,7 +4,7 @@
          (prefix-in sre: parser-tools/lex-sre)
          parser-tools/yacc)
 
-(define raw-command "dl2; c/BA/-")
+(define raw-command "c/B/g; l/1/g")
 (define fn "/Users/scott/work/racket/z.txt")
 
 (define-tokens a (NUM RE GLOBAL-RE ACTION))
@@ -64,6 +64,9 @@
 (define (string->regexp r)
   (regexp (substring r 1 (sub1 (string-length r)))))
 
+(define (string->global-regexp r)
+  (regexp (substring r 1 (- (string-length r) 2))))
+
 (define (columns-match locations first-line)
   (let* ([headers (string-split first-line (separator))]
          [n-columns (length headers)]
@@ -75,6 +78,11 @@
     (for ([location locations])
       (match location
         [(or (num-exp _) (re-exp _)) (vector-set! column-matches (loc-match location) #t)]
+        [(global-re-exp r) (let ([re (string->global-regexp r)])
+                             (for ([i (in-range n-columns)]
+                                   [h headers])                               
+                               (when (regexp-match re h)
+                                 (vector-set! column-matches i #t))))]
         [(range-exp 'start end) (let ([end-i (loc-match end)])
                                   (for ([i (in-range (add1 end-i))])
                                     (vector-set! column-matches i #t)))]
@@ -140,6 +148,14 @@
             (when at-upper? (set! done? #t))
             _started?)))))
 
+(define global-re-line%
+  (class object%
+    (init re)
+    (define _re re)
+    (super-new)
+    (define/public (in-range? line line-number)
+      (regexp-match _re line))))
+
 (define line-keeper%
   (class object%
     (init locs [invert? #f])
@@ -150,7 +166,8 @@
                [(or (num-exp _) (re-exp _)) (new line-range% [lower loc] [upper loc])]
                [(range-exp 'start upper) (new line-range% [lower 1] [upper upper] [started? #t])]
                [(range-exp lower 'end) (new line-range% [lower lower] [upper +inf.0])]
-               [(range-exp lower upper) (new line-range% [lower lower] [upper upper])])) locs))
+               [(range-exp lower upper) (new line-range% [lower lower] [upper upper])]
+               [(global-re-exp r) (new global-re-line% [re (string->global-regexp r)])])) locs))
     (super-new)
     (define line-number 0)
     (define/public (process line)
