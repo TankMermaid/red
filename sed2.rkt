@@ -196,8 +196,8 @@ Whitespace in the command string is ignored."
           (if _invert?
               (set! line-action (take-column-lambda (map not cols)))
               (set! line-action (take-column-lambda cols)))))
-      ; perform line action
-      (line-action line))))
+      ; perform line action; always keep
+      (list (line-action line) #t))))
 
 (define line-range%
   (class object%
@@ -213,18 +213,16 @@ Whitespace in the command string is ignored."
         [(num-exp n #f) n]
         [(num-exp _ #t) (error "can't count from the end in lines")]))
     (define _started? started?)
-    (define done? #f)
     (super-new)
     (define/public (in-range? line line-number)
-      (if done?
-          #f
-          (let ([at-lower? (or (and (regexp? _lower) (regexp-match _lower line))
-                               (and (number? _lower) (equal? _lower line-number)))]
-                [at-upper? (or (and (regexp? _upper) (regexp-match _upper line))
-                               (and (number? _upper) (equal? _upper line-number)))])
-            (when at-lower? (set! _started? #t))
-            (when at-upper? (set! done? #t))
-            _started?)))))
+      (let ([at-lower? (or (and (regexp? _lower) (regexp-match _lower line))
+                           (and (number? _lower) (equal? _lower line-number)))]
+            [at-upper? (or (and (regexp? _upper) (regexp-match _upper line))
+                           (and (number? _upper) (equal? _upper line-number)))])
+        (cond
+          [at-upper? '(#t #f)] ; we're in range and don't keep me
+          [at-lower? '(#t #t)] ; in range and keep me
+          [else '(#f #t)]))))) ; not in range and keep me
 
 (define global-re-line%
   (class object%
@@ -232,7 +230,14 @@ Whitespace in the command string is ignored."
     (define _re re)
     (super-new)
     (define/public (in-range? line line-number)
-      (regexp-match _re line))))
+      ; 
+      (list (regexp-match _re line) #t))))
+
+(define (keep-where lst-keep? lst)
+  (for/list ([keep? lst-keep?]
+             [item lst]
+             #:when keep?)
+    item))
 
 (define line-keeper%
   (class object%
@@ -250,9 +255,17 @@ Whitespace in the command string is ignored."
     (define line-number 0)
     (define/public (process line)
       (set! line-number (add1 line-number))
-      (if (xor _invert? (ormap (λ (range) (send range in-range? line line-number)) ranges))
-          line
-          #f))))
+      (let* ([results (map (λ (range) (send range in-range? line line-number)) ranges)]
+             ; are we in any of the ranges?
+             [in-range? (ormap identity (map first results))]
+             ; which of these ranges should I keep?
+             [keep-range? (map second results)]
+             [keep-me? (ormap identity keep-range?)])
+        ; remove done ranges
+        (set! ranges (keep-where keep-range? ranges))
+        (if in-range?
+            (list line keep-me?)
+            (list #f keep-me?))))))
 
 (define substitutor%
   (class object%
@@ -267,7 +280,7 @@ Whitespace in the command string is ignored."
         [else (error (format "unknown flags \"~a\" in substitute command" (list->string _flags)))]))
     (super-new)
     (define/public (process line)
-      (f line))))
+      (list (f line) #t)))) ; always keep
 
 (define command->object
   (match-lambda
@@ -281,9 +294,15 @@ Whitespace in the command string is ignored."
 (define command-objects (map command->object commands))
 
 (for ([line (in-lines)])
+  #:break (zero? (length command-objects))
   (let ([out-line (for/fold ([l line])
                             ([obj command-objects])
                     #:break (not l)
-                    (send obj process l))])
+                    (let* ([res (send obj process l)]
+                           [new-line (first res)]
+                           [keep-obj? (second res)])
+                      (unless keep-obj?
+                        (set! command-objects (remove obj command-objects)))
+                      new-line))])
     (when out-line
       (displayln out-line))))
